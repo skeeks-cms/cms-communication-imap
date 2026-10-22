@@ -18,11 +18,18 @@
     ],
     "require": {
         "php": ">=8.0",
-        "skeeks/cms-communication": "*"
+        "skeeks/cms-communication": "^1.0",
+        "symfony/mailer": "^6.4 || ^7.0"
     },
     "autoload": {
         "psr-4": {
             "skeeks\\cms\\communication\\imap\\": "src/"
+        }
+    },
+    "extra": {
+        "config-plugin": {
+            "web": ["src/config/common.php"],
+            "console": ["src/config/common.php"]
         }
     }
 }
