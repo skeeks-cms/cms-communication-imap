@@ -9,8 +9,10 @@ namespace skeeks\cms\communication\imap;
 
 /**
  * A small IMAP4rev1 client over a PHP stream: the commands a mailbox reader
- * needs (LOGIN, LIST, EXAMINE, UID SEARCH, UID FETCH, APPEND, LOGOUT).
- * It does not need ext-imap. Literals ({n}) are supported in both directions.
+ * needs (LOGIN, LIST, EXAMINE, UID SEARCH, UID FETCH, APPEND, LOGOUT) and the
+ * ones that change a mailbox (SELECT, STATUS, UID MOVE / COPY / STORE /
+ * EXPUNGE, CREATE). It does not need ext-imap. Literals ({n}) are supported
+ * in both directions.
  *
  * Exception messages never contain the password or the LOGIN command.
  */
@@ -19,6 +21,10 @@ class ImapClient
     /** @var resource|null */
     private $stream;
     private int $tagCounter = 0;
+    /** @var string[]|null upper-case capabilities, asked once per connection */
+    private ?array $capabilities = null;
+    /** Text of the last tagged OK: COPYUID of UID COPY comes there. */
+    private string $lastTagged = '';
 
     public function __construct(
         private string $host,
@@ -70,38 +76,217 @@ class ImapClient
     }
 
     /**
-     * @return array[] each: name, flags (lowercased, e.g. "\sent")
+     * @return array[] each: name, flags (lowercased, e.g. "\sent"), delimiter (string|null)
      */
     public function listFolders(): array
     {
         $folders = [];
         foreach ($this->command('LIST "" "*"') as $item) {
-            if (!preg_match('/^\* LIST \(([^)]*)\) (?:NIL|"(?:[^"\\\\]|\\\\.)*") (.+)$/is', $item['text'], $m)) {
+            if (!preg_match('/^\* LIST \(([^)]*)\) (NIL|"(?:[^"\\\\]|\\\\.)*") (.+)$/is', $item['text'], $m)) {
                 continue;
             }
             $folders[] = [
-                'name' => $this->parseAstring(trim($m[2]), $item['literals']),
+                'name' => $this->parseAstring(trim($m[3]), $item['literals']),
                 'flags' => array_map('strtolower', preg_split('/\s+/', trim($m[1]), -1, PREG_SPLIT_NO_EMPTY)),
+                'delimiter' => strtoupper($m[2]) === 'NIL' ? null : stripcslashes(substr($m[2], 1, -1)),
             ];
         }
 
         return $folders;
     }
 
+    /** @return string[] upper-case capabilities */
+    public function capabilities(): array
+    {
+        if ($this->capabilities === null) {
+            $this->capabilities = [];
+            foreach ($this->command('CAPABILITY') as $item) {
+                if (preg_match('/^\* CAPABILITY (.+)$/i', $item['text'], $m)) {
+                    $this->capabilities = array_map('strtoupper', preg_split('/\s+/', trim($m[1]), -1, PREG_SPLIT_NO_EMPTY));
+                }
+            }
+        }
+
+        return $this->capabilities;
+    }
+
+    public function hasCapability(string $name): bool
+    {
+        return in_array(strtoupper($name), $this->capabilities(), true);
+    }
+
     /**
      * Opens a folder read-only.
      *
-     * @return array uidvalidity, uidnext
+     * @return array uidvalidity, uidnext, permanentflags (string[]|null)
      */
     public function examine(string $folder): array
     {
-        $result = ['uidvalidity' => null, 'uidnext' => null];
-        foreach ($this->command(['EXAMINE ', $this->string($folder)]) as $item) {
+        return $this->open('EXAMINE', $folder);
+    }
+
+    /**
+     * Opens a folder for changes.
+     *
+     * @return array uidvalidity, uidnext, permanentflags (string[]|null)
+     */
+    public function select(string $folder): array
+    {
+        return $this->open('SELECT', $folder);
+    }
+
+    private function open(string $command, string $folder): array
+    {
+        $result = ['uidvalidity' => null, 'uidnext' => null, 'permanentflags' => null];
+        foreach ($this->command([$command.' ', $this->string($folder)]) as $item) {
             if (preg_match('/\[UIDVALIDITY (\d+)\]/i', $item['text'], $m)) {
                 $result['uidvalidity'] = (int)$m[1];
             }
             if (preg_match('/\[UIDNEXT (\d+)\]/i', $item['text'], $m)) {
                 $result['uidnext'] = (int)$m[1];
+            }
+            if (preg_match('/\[PERMANENTFLAGS \(([^)]*)\)\]/i', $item['text'], $m)) {
+                $result['permanentflags'] = preg_split('/\s+/', trim($m[1]), -1, PREG_SPLIT_NO_EMPTY);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Folder counters without opening it.
+     *
+     * @return array uidvalidity, uidnext, messages (int|null each)
+     */
+    public function status(string $folder): array
+    {
+        $result = ['uidvalidity' => null, 'uidnext' => null, 'messages' => null];
+        foreach ($this->command(['STATUS ', $this->string($folder), ' (MESSAGES UIDNEXT UIDVALIDITY)']) as $item) {
+            foreach (['messages' => 'MESSAGES', 'uidnext' => 'UIDNEXT', 'uidvalidity' => 'UIDVALIDITY'] as $key => $word) {
+                if (preg_match('/\b'.$word.' (\d+)/i', $item['text'], $m)) {
+                    $result[$key] = (int)$m[1];
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * UID MOVE; where the server has no MOVE: UID COPY, UID STORE \Deleted and
+     * UID EXPUNGE (plain EXPUNGE without UIDPLUS). The folder must be selected.
+     *
+     * @param int[] $uids
+     * @return array uidvalidity (int|null) of the target, uids: old uid => new uid (from COPYUID, may be empty)
+     */
+    public function uidMove(array $uids, string $target): array
+    {
+        $set = self::uidSet($uids);
+        if ($this->hasCapability('MOVE')) {
+            $items = $this->command(['UID MOVE '.$set.' ', $this->string($target)]);
+        } else {
+            $items = $this->command(['UID COPY '.$set.' ', $this->string($target)]);
+            $copied = $this->lastTagged;
+            $this->command('UID STORE '.$set.' +FLAGS.SILENT (\\Deleted)');
+            // Plain EXPUNGE also removes letters someone else marked deleted: only without UIDPLUS.
+            $this->command($this->hasCapability('UIDPLUS') ? 'UID EXPUNGE '.$set : 'EXPUNGE');
+            $this->lastTagged = $copied;
+        }
+        $texts = array_column($items, 'text');
+        $texts[] = $this->lastTagged;
+        foreach ($texts as $text) {
+            if (preg_match('/\[COPYUID (\d+) ([0-9:,]+) ([0-9:,]+)\]/i', $text, $m)) {
+                $from = self::expandSet($m[2]);
+                $to = self::expandSet($m[3]);
+                if (count($from) === count($to)) {
+                    return ['uidvalidity' => (int)$m[1], 'uids' => array_combine($from, $to)];
+                }
+            }
+        }
+
+        return ['uidvalidity' => null, 'uids' => []];
+    }
+
+    /**
+     * @param int[] $uids
+     * @return array[] uid => flags and keywords
+     */
+    public function fetchFlags(array $uids): array
+    {
+        if (!$uids) {
+            return [];
+        }
+        $result = [];
+        foreach ($this->command('UID FETCH '.self::uidSet($uids).' (UID FLAGS)') as $item) {
+            if (preg_match('/^\* \d+ FETCH /i', $item['text'])
+                && preg_match('/\bUID (\d+)/i', $item['text'], $uid)
+                && preg_match('/\bFLAGS \(([^)]*)\)/i', $item['text'], $flags)) {
+                $result[(int)$uid[1]] = preg_split('/\s+/', trim($flags[1]), -1, PREG_SPLIT_NO_EMPTY);
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * @param int[] $uids
+     * @param string $sign "+" adds, "-" removes
+     * @param string[] $flags system flags (\Seen) or keywords (atoms)
+     */
+    public function storeFlags(array $uids, string $sign, array $flags): void
+    {
+        $flags = array_values(array_filter($flags, static fn($f) => (bool)preg_match('/^\\\\?[A-Za-z0-9$_.\-]+$/', (string)$f)));
+        if (!$uids || !$flags) {
+            return;
+        }
+        $this->command('UID STORE '.self::uidSet($uids).' '.($sign === '-' ? '-' : '+').'FLAGS.SILENT ('.implode(' ', $flags).')');
+    }
+
+    public function create(string $folder): void
+    {
+        $this->command(['CREATE ', $this->string($folder)]);
+    }
+
+    /**
+     * A compact UID set: [1, 2, 3, 7] → "1:3,7".
+     *
+     * @param int[] $uids
+     */
+    public static function uidSet(array $uids): string
+    {
+        $uids = array_values(array_unique(array_map('intval', $uids)));
+        sort($uids);
+        $parts = [];
+        $start = $prev = null;
+        foreach ($uids as $uid) {
+            if ($start !== null && $uid === $prev + 1) {
+                $prev = $uid;
+                continue;
+            }
+            if ($start !== null) {
+                $parts[] = $start === $prev ? (string)$start : $start.':'.$prev;
+            }
+            $start = $prev = $uid;
+        }
+        if ($start !== null) {
+            $parts[] = $start === $prev ? (string)$start : $start.':'.$prev;
+        }
+
+        return implode(',', $parts);
+    }
+
+    /** @return int[] "3:5,9" → [3, 4, 5, 9], in the order of the set */
+    public static function expandSet(string $set): array
+    {
+        $result = [];
+        foreach (explode(',', $set) as $part) {
+            if (strpos($part, ':') !== false) {
+                [$a, $b] = array_map('intval', explode(':', $part, 2));
+                foreach (range($a, $b) as $uid) {
+                    $result[] = $uid;
+                }
+            } elseif ($part !== '') {
+                $result[] = (int)$part;
             }
         }
 
@@ -241,10 +426,11 @@ class ImapClient
             $line = $this->readLine();
             if (strncmp($line, $tag.' ', strlen($tag) + 1) === 0) {
                 $status = strtoupper((string)strtok(substr($line, strlen($tag) + 1), ' '));
+                $text = trim(substr($line, strlen($tag) + 1 + strlen($status)));
                 if ($status !== 'OK') {
-                    $text = trim(substr($line, strlen($tag) + 1 + strlen($status)));
                     throw new ImapException('Сервер IMAP ответил '.$status.': '.$text, $text);
                 }
+                $this->lastTagged = $text;
 
                 return $items;
             }
